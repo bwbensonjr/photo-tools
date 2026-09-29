@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
 from photo_tools import google_photos_cli
-from photo_tools.google_photos import GooglePhotosError, HttpResponse
+from photo_tools.google_photos import (
+    API_BASE,
+    GooglePhotosError,
+    HttpResponse,
+    UploadJournal,
+    build_album_plan,
+)
 from photo_tools.google_photos_cli import build_parser, default_client_config, main, run
+from photo_tools.scan_metadata import build_plan
 
 from conftest import make_folder
 
@@ -49,6 +57,20 @@ class FakeAuthorizer:
     def authorized_transport(self, client_config_path: Path):
         self.paths.append(client_config_path)
         return self.transport
+
+
+class ScriptedTransport:
+    def __init__(self, responses: list[HttpResponse]) -> None:
+        self.responses = list(responses)
+        self.requests: list[dict[str, object]] = []
+
+    def request(self, method: str, url: str, **kwargs) -> HttpResponse:
+        self.requests.append({"method": method, "url": url, **kwargs})
+        return self.responses.pop(0)
+
+
+def json_response(body: dict[str, object]) -> HttpResponse:
+    return HttpResponse(200, json.dumps(body).encode("utf-8"), {})
 
 
 def digest(path: Path) -> str:
@@ -154,6 +176,7 @@ def test_explicit_upload_uses_authorizer_and_writes_non_secret_journal(
 
     output = capsys.readouterr().out
     assert authorizer.paths == [client_config]
+    assert "upload state: confirmed: 0/1 headings, 0/1 photos" in output
     assert f"uploading folder: {folder.name}" in output
     assert "confirmed: 1/1 headings, 1/1 photos" in output
     assert "album ready: https://photos.example/album-1" in output
@@ -217,3 +240,109 @@ def test_confirmed_failure_reports_each_progress_category(tmp_path: Path) -> Non
     assert "failed: confirmed request failure" in message
     assert "uncertain: none" in message
     assert "unattempted: 1 headings, 1 photos" in message
+
+
+def test_incremental_cli_reports_planned_predecessor(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first = make_folder(tmp_path, "1997-01-01-First", ["a.jpg"])
+    last = make_folder(tmp_path, "1997-03-01-Last", ["c.jpg"])
+    initial_scan = build_plan(tmp_path)
+    initial_plan = build_album_plan(
+        initial_scan, initial_scan.entries, title="Family scans"
+    )
+    journal_path = tmp_path / "journal.json"
+    journal = UploadJournal.open_or_create(journal_path, initial_plan)
+    journal.set_album("album-1", "https://photos.example/album-1")
+    for group, media_id in zip(initial_plan.groups, ["media-a", "media-c"], strict=True):
+        journal.confirm_heading(group.key, f"heading-{media_id}")
+        journal.confirm_media(group.photos[0].key, media_id, "")
+    middle = make_folder(tmp_path, "1997-02-01-Middle", ["b.jpg"])
+    transport = ScriptedTransport(
+        [
+            json_response({"id": "album-1", "title": "Family scans"}),
+            json_response({"mediaItems": [{"id": "media-a"}, {"id": "media-c"}]}),
+            json_response({"enrichmentItem": {"id": "heading-b"}}),
+            HttpResponse(200, b"token-b", {}),
+            json_response(
+                {
+                    "newMediaItemResults": [
+                        {
+                            "status": {"code": 0},
+                            "mediaItem": {"id": "media-b", "productUrl": ""},
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    args = build_parser().parse_args(
+        [
+            "--root",
+            str(tmp_path),
+            "--album-title",
+            "Family scans",
+            "--upload",
+            "--client-config",
+            str(tmp_path.parent / "external-client.json"),
+            "--journal",
+            str(journal_path),
+        ]
+    )
+
+    assert run(args, authorizer=FakeAuthorizer(transport)) == 0
+
+    output = capsys.readouterr().out
+    assert "upload state: confirmed: 2/3 headings, 2/3 photos" in output
+    assert (
+        f"pending placement: {middle.name} -> after {first.name}/a.jpg" in output
+    )
+    assert f"uploading folder: {middle.name}" in output
+    assert f"uploading folder: {last.name}" not in output
+
+
+def test_incremental_cli_reports_remote_order_drift_without_mutation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    make_folder(tmp_path, "1997-01-01-First", ["a.jpg"])
+    make_folder(tmp_path, "1997-03-01-Last", ["c.jpg"])
+    initial_scan = build_plan(tmp_path)
+    initial_plan = build_album_plan(
+        initial_scan, initial_scan.entries, title="Family scans"
+    )
+    journal_path = tmp_path / "journal.json"
+    journal = UploadJournal.open_or_create(journal_path, initial_plan)
+    journal.set_album("album-1", "https://photos.example/album-1")
+    for group, media_id in zip(initial_plan.groups, ["media-a", "media-c"], strict=True):
+        journal.confirm_heading(group.key, f"heading-{media_id}")
+        journal.confirm_media(group.photos[0].key, media_id, "")
+    make_folder(tmp_path, "1997-02-01-Middle", ["b.jpg"])
+    transport = ScriptedTransport(
+        [
+            json_response({"id": "album-1", "title": "Family scans"}),
+            json_response({"mediaItems": [{"id": "media-c"}, {"id": "media-a"}]}),
+        ]
+    )
+    args = build_parser().parse_args(
+        [
+            "--root",
+            str(tmp_path),
+            "--album-title",
+            "Family scans",
+            "--upload",
+            "--client-config",
+            str(tmp_path.parent / "external-client.json"),
+            "--journal",
+            str(journal_path),
+        ]
+    )
+
+    with pytest.raises(GooglePhotosError, match="remote album order drift"):
+        run(args, authorizer=FakeAuthorizer(transport))
+
+    output = capsys.readouterr().out
+    assert "pending placement: 1997-02-01-Middle" in output
+    assert [request["url"] for request in transport.requests] == [
+        f"{API_BASE}/albums/album-1",
+        f"{API_BASE}/mediaItems:search",
+    ]

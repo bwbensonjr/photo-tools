@@ -30,3 +30,25 @@ Follow the manual Google Photos acceptance procedure in `README.md` with two dis
 The first authorization attempts were blocked while the OAuth application was in testing mode because the account had not yet been listed as a test user. Authorization and upload completed after `bwbensonjr@gmail.com` was added as a test user. The completed journal recorded two confirmed headings, two confirmed media items, no failed operations, and no uncertain operation. The temporary album is `Photo Tools Acceptance 2026-09-28`.
 
 Do not record client secrets, authorization codes, access tokens, refresh tokens, or authorization headers. None are recorded here.
+
+## Chronological Incremental Insertion
+
+Use a new disposable scan root and application-owned album; do not reuse the production album for this acceptance check.
+
+1. Create and tag an early folder and a late folder, each containing one disposable JPEG.
+2. Upload the complete root and visually confirm the early heading and photo precede the late heading and photo.
+3. Add and tag a middle-dated folder containing one disposable JPEG.
+4. Rerun `google-photos-upload` against the complete root with the same album title and journal.
+5. Confirm the command reports only the middle folder as pending and places it after the early photo.
+6. Open the album in Google Photos and visually confirm the final heading and photo order is early, middle, late.
+
+### Incremental Results
+
+- Date tested: Pending
+- Disposable album title: Pending
+- Initial early-before-late order confirmed: Pending
+- Only the middle folder reported and uploaded as pending: Pending
+- Final early, middle, late heading order visually confirmed: Pending
+- Final early, middle, late photograph order visually confirmed: Pending
+- Existing early and late media IDs remained unchanged in the journal: Pending
+- Source SHA-256 hashes remained unchanged: Pending

@@ -49,6 +49,53 @@ class TransportFailure(Exception):
 
 
 @dataclass(frozen=True)
+class AlbumPosition:
+    """A validated Google Photos album position."""
+
+    position: str
+    relative_media_item_id: str | None = None
+    relative_enrichment_item_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.position == "FIRST_IN_ALBUM":
+            valid = (
+                self.relative_media_item_id is None
+                and self.relative_enrichment_item_id is None
+            )
+        elif self.position == "AFTER_MEDIA_ITEM":
+            valid = bool(self.relative_media_item_id) and self.relative_enrichment_item_id is None
+        elif self.position == "AFTER_ENRICHMENT_ITEM":
+            valid = bool(self.relative_enrichment_item_id) and self.relative_media_item_id is None
+        else:
+            valid = False
+        if not valid:
+            raise GooglePhotosError("invalid Google Photos album position")
+
+    @classmethod
+    def first(cls) -> AlbumPosition:
+        return cls("FIRST_IN_ALBUM")
+
+    @classmethod
+    def after_media(cls, media_id: str) -> AlbumPosition:
+        return cls("AFTER_MEDIA_ITEM", relative_media_item_id=media_id)
+
+    @classmethod
+    def after_enrichment(cls, enrichment_id: str) -> AlbumPosition:
+        return cls(
+            "AFTER_ENRICHMENT_ITEM",
+            relative_enrichment_item_id=enrichment_id,
+        )
+
+    def to_json(self) -> dict[str, str]:
+        value = {"position": self.position}
+        if self.relative_media_item_id is not None:
+            value["relativeMediaItemId"] = self.relative_media_item_id
+        if self.relative_enrichment_item_id is not None:
+            value["relativeEnrichmentItemId"] = self.relative_enrichment_item_id
+        return value
+
+
+@dataclass(frozen=True)
 class AlbumPhoto:
     """One source photograph and its Google Photos presentation metadata."""
 
@@ -66,6 +113,14 @@ class AlbumGroup:
     folder_name: str
     heading: str
     photos: tuple[AlbumPhoto, ...]
+
+
+@dataclass(frozen=True)
+class PendingMediaBatch:
+    """The next contiguous, positioned media batch to create."""
+
+    photos: tuple[AlbumPhoto, ...]
+    position: AlbumPosition
 
 
 @dataclass(frozen=True)
@@ -310,6 +365,37 @@ def _journal_plan(plan: AlbumPlan) -> list[dict[str, Any]]:
     ]
 
 
+def _is_additive_folder_extension(
+    stored_plan: object, expected_plan: list[dict[str, Any]]
+) -> bool:
+    """Return whether expected_plan only inserts new, complete folder groups."""
+    if not isinstance(stored_plan, list):
+        return False
+
+    stored_keys: list[str] = []
+    expected_by_key: dict[str, dict[str, Any]] = {}
+    for group in expected_plan:
+        key = group.get("key")
+        if not isinstance(key, str) or key in expected_by_key:
+            return False
+        expected_by_key[key] = group
+
+    for group in stored_plan:
+        if not isinstance(group, dict):
+            return False
+        key = group.get("key")
+        if not isinstance(key, str) or key in stored_keys:
+            return False
+        if expected_by_key.get(key) != group:
+            return False
+        stored_keys.append(key)
+
+    expected_existing_keys = [
+        group["key"] for group in expected_plan if group["key"] in stored_keys
+    ]
+    return expected_existing_keys == stored_keys and len(expected_plan) > len(stored_plan)
+
+
 class UploadJournal:
     """Atomic, non-secret record of confirmed and uncertain upload state."""
 
@@ -334,11 +420,17 @@ class UploadJournal:
                 raise GooglePhotosError("unsupported or invalid upload journal version")
             if data.get("root") != str(plan.root) or data.get("title") != plan.title:
                 raise GooglePhotosError("upload journal does not match the source root and album title")
-            if data.get("plan") != expected_plan:
-                raise GooglePhotosError(
-                    "upload journal does not match the current files or album plan; "
-                    "source content may have changed"
-                )
+            stored_plan = data.get("plan")
+            if stored_plan != expected_plan:
+                if not _is_additive_folder_extension(stored_plan, expected_plan):
+                    raise GooglePhotosError(
+                        "upload journal does not match the current files or album plan; "
+                        "source content may have changed"
+                    )
+                journal = cls(resolved, plan, data)
+                journal.data["plan"] = expected_plan
+                journal.save()
+                return journal
             return cls(resolved, plan, data)
 
         data = {
@@ -638,13 +730,59 @@ class GooglePhotosClient:
             "GET", f"{API_BASE}/albums/{album_id}", mutation=False
         ).json()
 
-    def add_heading(self, album_id: str, heading: str) -> str:
+    def album_media_ids(self, album_id: str) -> list[str]:
+        """Return all application-created media IDs in remote album order."""
+        media_ids: list[str] = []
+        page_token: str | None = None
+        seen_tokens: set[str] = set()
+        while True:
+            body: dict[str, Any] = {"albumId": album_id, "pageSize": 100}
+            if page_token is not None:
+                body["pageToken"] = page_token
+            payload = self._request(
+                "POST",
+                f"{API_BASE}/mediaItems:search",
+                json_body=body,
+                mutation=False,
+            ).json()
+            items = payload.get("mediaItems", [])
+            if not isinstance(items, list):
+                raise ConfirmedRequestError(
+                    "album media search returned an invalid mediaItems value"
+                )
+            for item in items:
+                media_id = item.get("id") if isinstance(item, dict) else None
+                if not isinstance(media_id, str) or not media_id:
+                    raise ConfirmedRequestError(
+                        "album media search returned an item without an ID"
+                    )
+                media_ids.append(media_id)
+            next_token = payload.get("nextPageToken")
+            if next_token is None:
+                return media_ids
+            if (
+                not isinstance(next_token, str)
+                or not next_token
+                or next_token in seen_tokens
+            ):
+                raise ConfirmedRequestError(
+                    "album media search returned an invalid page token"
+                )
+            seen_tokens.add(next_token)
+            page_token = next_token
+
+    def add_heading(
+        self,
+        album_id: str,
+        heading: str,
+        position: AlbumPosition,
+    ) -> str:
         response = self._request(
             "POST",
             f"{API_BASE}/albums/{album_id}:addEnrichment",
             json_body={
                 "newEnrichmentItem": {"textEnrichment": {"text": heading}},
-                "albumPosition": {"position": "LAST_IN_ALBUM"},
+                "albumPosition": position.to_json(),
             },
             mutation=True,
         ).json()
@@ -676,12 +814,13 @@ class GooglePhotosClient:
         album_id: str,
         photos: Sequence[AlbumPhoto],
         upload_tokens: Sequence[str],
+        position: AlbumPosition,
     ) -> list[dict[str, str]]:
         if len(photos) != len(upload_tokens) or len(photos) > MAX_BATCH_ITEMS:
             raise GooglePhotosError("invalid Google Photos media batch")
         body = {
             "albumId": album_id,
-            "albumPosition": {"position": "LAST_IN_ALBUM"},
+            "albumPosition": position.to_json(),
             "newMediaItems": [
                 {
                     "description": photo.description,
@@ -727,6 +866,129 @@ class GooglePhotosClient:
         return parsed
 
 
+def _confirmed_id(records: object, key: str, *, kind: str) -> str | None:
+    if not isinstance(records, dict):
+        raise GooglePhotosError(f"upload journal contains invalid confirmed {kind}")
+    record = records.get(key)
+    if record is None:
+        return None
+    if kind == "heading":
+        remote_id = record
+    else:
+        remote_id = record.get("id") if isinstance(record, dict) else None
+    if not isinstance(remote_id, str) or not remote_id:
+        raise GooglePhotosError(f"upload journal contains an invalid {kind} ID")
+    return remote_id
+
+
+def confirmed_media_ids(plan: AlbumPlan, journal: UploadJournal) -> list[str]:
+    """Return confirmed media IDs in complete local plan order."""
+    records = journal.data.get("confirmed_media")
+    result: list[str] = []
+    for group in plan.groups:
+        for photo in group.photos:
+            remote_id = _confirmed_id(records, photo.key, kind="media")
+            if remote_id is not None:
+                result.append(remote_id)
+    return result
+
+
+def heading_position(
+    plan: AlbumPlan, group: AlbumGroup, journal: UploadJournal
+) -> AlbumPosition:
+    """Derive a pending heading's position from its confirmed predecessor."""
+    records = journal.data.get("confirmed_media")
+    predecessor = None
+    found = False
+    for candidate in plan.groups:
+        if candidate.key == group.key:
+            found = True
+            break
+        for photo in candidate.photos:
+            remote_id = _confirmed_id(records, photo.key, kind="media")
+            if remote_id is not None:
+                predecessor = remote_id
+    if not found:
+        raise GooglePhotosError(f"album group is not present in plan: {group.key}")
+    if predecessor is None:
+        return AlbumPosition.first()
+    return AlbumPosition.after_media(predecessor)
+
+
+def next_pending_media_batch(
+    group: AlbumGroup, journal: UploadJournal
+) -> PendingMediaBatch | None:
+    """Return the next contiguous pending run, bounded by the API batch limit."""
+    media_records = journal.data.get("confirmed_media")
+    heading_records = journal.data.get("confirmed_headings")
+    first_pending: int | None = None
+    for index, photo in enumerate(group.photos):
+        if _confirmed_id(media_records, photo.key, kind="media") is None:
+            first_pending = index
+            break
+    if first_pending is None:
+        return None
+
+    if first_pending == 0:
+        heading_id = _confirmed_id(heading_records, group.key, kind="heading")
+        if heading_id is None:
+            raise GooglePhotosError(
+                f"cannot position media before confirming heading: {group.key}"
+            )
+        position = AlbumPosition.after_enrichment(heading_id)
+    else:
+        predecessor = _confirmed_id(
+            media_records,
+            group.photos[first_pending - 1].key,
+            kind="media",
+        )
+        if predecessor is None:
+            raise GooglePhotosError(
+                f"cannot position noncontiguous pending media: {group.key}"
+            )
+        position = AlbumPosition.after_media(predecessor)
+
+    photos: list[AlbumPhoto] = []
+    for photo in group.photos[first_pending:]:
+        if _confirmed_id(media_records, photo.key, kind="media") is not None:
+            break
+        photos.append(photo)
+        if len(photos) == MAX_BATCH_ITEMS:
+            break
+    return PendingMediaBatch(tuple(photos), position)
+
+
+def pending_group_placements(
+    plan: AlbumPlan, journal: UploadJournal
+) -> tuple[tuple[str, str], ...]:
+    """Describe planned local placement for each group with pending work."""
+    heading_records = journal.data.get("confirmed_headings")
+    media_records = journal.data.get("confirmed_media")
+    placements: list[tuple[str, str]] = []
+    predecessor_key: str | None = None
+    for group in plan.groups:
+        heading_pending = _confirmed_id(
+            heading_records, group.key, kind="heading"
+        ) is None
+        media_pending = any(
+            _confirmed_id(media_records, photo.key, kind="media") is None
+            for photo in group.photos
+        )
+        if heading_pending or media_pending:
+            placement = (
+                "beginning of album"
+                if predecessor_key is None
+                else f"after {predecessor_key}"
+            )
+            placements.append((group.folder_name, placement))
+        predecessor_key = group.photos[-1].key
+    return tuple(placements)
+
+
+def _has_pending_work(plan: AlbumPlan, journal: UploadJournal) -> bool:
+    return bool(pending_group_placements(plan, journal))
+
+
 def upload_album(
     plan: AlbumPlan,
     journal: UploadJournal,
@@ -742,6 +1004,7 @@ def upload_album(
         )
 
     album = journal.data.get("album")
+    existing_album = album is not None
     if album is None:
         try:
             album_id, product_url = client.create_album(plan.title)
@@ -761,33 +1024,66 @@ def upload_album(
         if remote_album.get("id") != album_id:
             raise GooglePhotosError("recorded application-created album is no longer accessible")
 
+    if existing_album and _has_pending_work(plan, journal):
+        expected_ids = confirmed_media_ids(plan, journal)
+        remote_ids = client.album_media_ids(album_id)
+        if remote_ids != expected_ids:
+            mismatch = next(
+                (
+                    index
+                    for index, pair in enumerate(
+                        zip(remote_ids, expected_ids, strict=False)
+                    )
+                    if pair[0] != pair[1]
+                ),
+                min(len(remote_ids), len(expected_ids)),
+            )
+            raise GooglePhotosError(
+                "remote album order drift detected before upload at media position "
+                f"{mismatch + 1}; expected {len(expected_ids)} confirmed items, "
+                f"found {len(remote_ids)}"
+            )
+
     for group in plan.groups:
-        heading_pending = group.key not in journal.data["confirmed_headings"]
-        pending = [
-            photo
-            for photo in group.photos
-            if photo.key not in journal.data["confirmed_media"]
-        ]
-        if not heading_pending and not pending:
+        heading_id = _confirmed_id(
+            journal.data.get("confirmed_headings"), group.key, kind="heading"
+        )
+        batch = next_pending_media_batch(group, journal) if heading_id else None
+        if heading_id is not None and batch is None:
             continue
         if on_folder_start is not None:
             on_folder_start(group.folder_name)
 
-        if heading_pending:
+        if heading_id is None:
+            position = heading_position(plan, group, journal)
             try:
-                enrichment_id = client.add_heading(album_id, group.heading)
+                enrichment_id = client.add_heading(
+                    album_id, group.heading, position
+                )
             except KeyboardInterrupt as error:
-                journal.set_uncertain({"kind": "heading", "keys": [group.key]})
+                journal.set_uncertain(
+                    {
+                        "kind": "heading",
+                        "keys": [group.key],
+                        "position": position.to_json(),
+                    }
+                )
                 raise AmbiguousRequestError("interrupted while adding a heading") from error
             except AmbiguousRequestError:
-                journal.set_uncertain({"kind": "heading", "keys": [group.key]})
+                journal.set_uncertain(
+                    {
+                        "kind": "heading",
+                        "keys": [group.key],
+                        "position": position.to_json(),
+                    }
+                )
                 raise
             journal.confirm_heading(group.key, enrichment_id)
 
-        for offset in range(0, len(pending), MAX_BATCH_ITEMS):
-            batch = pending[offset : offset + MAX_BATCH_ITEMS]
+        while (pending_batch := next_pending_media_batch(group, journal)) is not None:
+            photos = pending_batch.photos
             tokens: list[str] = []
-            for photo in batch:
+            for photo in photos:
                 try:
                     tokens.append(client.upload_bytes(photo))
                 except KeyboardInterrupt as error:
@@ -801,17 +1097,26 @@ def upload_album(
                     journal.set_uncertain({"kind": "upload_bytes", "keys": [photo.key]})
                     raise
             try:
-                results = client.create_media(album_id, batch, tokens)
+                results = client.create_media(
+                    album_id,
+                    photos,
+                    tokens,
+                    pending_batch.position,
+                )
             except KeyboardInterrupt as error:
                 journal.set_uncertain(
-                    {"kind": "media", "keys": [photo.key for photo in batch]}
+                    {
+                        "kind": "media",
+                        "keys": [photo.key for photo in photos],
+                        "position": pending_batch.position.to_json(),
+                    }
                 )
                 raise AmbiguousRequestError(
                     "interrupted while creating Google Photos media items"
                 ) from error
             except ConfirmedRequestError as error:
                 partial = getattr(error, "partial_results", [])
-                for photo, result in zip(batch, partial, strict=False):
+                for photo, result in zip(photos, partial, strict=False):
                     if result:
                         journal.confirm_media(
                             photo.key, result["id"], result["product_url"]
@@ -819,9 +1124,13 @@ def upload_album(
                 raise
             except AmbiguousRequestError:
                 journal.set_uncertain(
-                    {"kind": "media", "keys": [photo.key for photo in batch]}
+                    {
+                        "kind": "media",
+                        "keys": [photo.key for photo in photos],
+                        "position": pending_batch.position.to_json(),
+                    }
                 )
                 raise
-            for photo, result in zip(batch, results, strict=True):
+            for photo, result in zip(photos, results, strict=True):
                 journal.confirm_media(photo.key, result["id"], result["product_url"])
     return product_url

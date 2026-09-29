@@ -16,6 +16,7 @@ from photo_tools.google_photos import (
     UploadJournal,
     album_manifest_text,
     build_album_plan,
+    pending_group_placements,
     render_album_preview,
     upload_album,
 )
@@ -141,6 +142,9 @@ def run(
             product_url=args.resolved_url,
         )
         print(f"resolved uncertain operation as {args.resolve_uncertain}")
+    print(f"upload state: {_progress_text(journal)}")
+    for folder_name, placement in pending_group_placements(album_plan, journal):
+        print(f"pending placement: {folder_name} -> {placement}")
 
     oauth = authorizer or InstalledAppAuthorizer()
     client_config = args.client_config or default_client_config()

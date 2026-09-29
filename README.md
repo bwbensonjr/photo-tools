@@ -88,6 +88,29 @@ Uploads use Original quality and consume Google storage. Albums are limited to 2
 
 Progress is stored in `ROOT/.scan-tools/google-photos-ALBUM-TITLE.json`. Use `--journal /path/to/journal.json` to override it. Rerunning the same command resumes confirmed incomplete work and refuses files whose contents changed.
 
+To add newly created scan folders to the same application-owned album, rerun the
+complete-root upload with the same album title and without `--only`:
+
+```bash
+uv run google-photos-upload \
+  --root /Users/bwb/Pictures/Scans \
+  --album-title "Family scans" \
+  --upload
+```
+
+The journal preserves confirmed uploads and uploads only photographs in entirely
+new folders. Existing folders must remain unchanged. New folder groups are inserted
+at their complete-plan chronological positions, including before or between existing
+groups. Before changing an existing album, the command verifies that every
+application-created photo still appears in journaled order and stops on remote-order
+drift.
+
+Google's album listing does not expose text enrichments or media added outside this
+application's access, so the command cannot validate manually moved headings or
+unrelated photos. If remote-order drift is reported, inspect the album and journal
+and restore the confirmed application-created photos to journal order before retrying;
+the command will not repair or append past drift automatically.
+
 ### Resolve an uncertain upload
 
 If the command reports that an operation may have completed, inspect the album and journal before continuing.

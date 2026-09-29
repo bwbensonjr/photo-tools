@@ -34,6 +34,10 @@ def test_readme_documents_primary_google_workflow_and_recovery() -> None:
     assert "Original quality" in text
     assert "20,000" in text
     assert "app-owned album" in text
+    assert "complete-plan chronological positions" in text
+    assert "application-created photo still appears in journaled order" in text
+    assert "cannot validate manually moved headings" in text
+    assert "unrelated photos" in text
     assert "configure recipients, link sharing, collaboration, comments, and likes manually" in text
 
 
@@ -43,4 +47,7 @@ def test_google_acceptance_record_excludes_secret_values() -> None:
     assert "native description" in text
     assert "Second account" in text
     assert "Source SHA-256 hashes unchanged" in text
+    assert "Chronological Incremental Insertion" in text
+    assert "early, middle, late heading order visually confirmed" in text
+    assert "early, middle, late photograph order visually confirmed" in text
     assert "Do not record client secrets" in text
