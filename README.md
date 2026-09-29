@@ -15,7 +15,7 @@ Scans must be JPEG files directly inside folders named `YYYY-MM-DD-description`:
 
 ```text
 Scans/
-  1997-03-06-Hannah-Maya/
+  1997-03-06-Birthdays/
   1997-03-06-In-the-woods/
 ```
 
