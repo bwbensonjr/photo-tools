@@ -26,6 +26,8 @@ def test_readme_documents_primary_google_workflow_and_recovery() -> None:
     assert "google-photos-upload" in text
     assert "--album-title" in text
     assert "--client-config" in text
+    assert "~/.config/photo-tools/google-photos-client.json" in text
+    assert "optional override" in text
     assert "--upload" in text
     assert "--only" in text
     assert "--resolve-uncertain" in text
@@ -34,6 +36,8 @@ def test_readme_documents_primary_google_workflow_and_recovery() -> None:
     assert "20,000" in text
     assert "app-created" in text
     assert "Share once after upload" in text
+    assert "choose specific recipients or link sharing" in text
+    assert "collaborators may add photographs, comments, and likes" in text
     assert "not an agent skill" in text
 
 

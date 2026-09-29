@@ -107,7 +107,7 @@ def test_preview_and_manifest_keep_duplicate_date_groups_contiguous(tmp_path: Pa
     assert preview.index("b.jpg") < preview.index("1997-03-06 - B second")
     assert 'a.jpg -> description "A first"' in preview
     assert "same-date groups: 1997-03-06 (2 folders)" in preview
-    assert "no OAuth flow or Google Photos request was performed" in preview
+    assert "no OAuth flow or Google Photos request was performed" not in preview
     assert manifest.index("## 1997-03-06 - A first") < manifest.index("## 1997-03-06 - B second")
 
 
@@ -151,9 +151,16 @@ def test_upload_orders_heading_then_native_descriptions_and_batches(tmp_path: Pa
         ]
     )
 
-    url = upload_album(plan, journal, GooglePhotosClient(transport, sleep=lambda _: None))
+    started: list[str] = []
+    url = upload_album(
+        plan,
+        journal,
+        GooglePhotosClient(transport, sleep=lambda _: None),
+        on_folder_start=started.append,
+    )
 
     assert url == "https://photos.example/album-1"
+    assert started == ["1997-03-06-A-first", "1997-03-06-B-second"]
     urls = [request["url"] for request in transport.requests]
     assert urls == [
         f"{API_BASE}/albums",
@@ -197,14 +204,36 @@ def test_resume_skips_confirmed_remote_work_and_rejects_changed_source(tmp_path:
             media_response("media-c"),
         ]
     )
-    upload_album(plan, resumed, GooglePhotosClient(second_transport, sleep=lambda _: None))
+    resumed_started: list[str] = []
+    upload_album(
+        plan,
+        resumed,
+        GooglePhotosClient(second_transport, sleep=lambda _: None),
+        on_folder_start=resumed_started.append,
+    )
 
+    assert resumed_started == ["1997-03-06-B-second"]
     assert [request["url"] for request in second_transport.requests] == [
         f"{API_BASE}/albums/album-1",
         google_photos.UPLOAD_URL,
         f"{API_BASE}/mediaItems:batchCreate",
     ]
     assert len(resumed.data["confirmed_media"]) == 3
+
+    complete_transport = FakeTransport(
+        [response(200, {"id": "album-1", "title": "Family scans"})]
+    )
+    complete_started: list[str] = []
+    upload_album(
+        plan,
+        UploadJournal.open_or_create(journal_path, plan),
+        GooglePhotosClient(complete_transport, sleep=lambda _: None),
+        on_folder_start=complete_started.append,
+    )
+    assert complete_started == []
+    assert [request["url"] for request in complete_transport.requests] == [
+        f"{API_BASE}/albums/album-1"
+    ]
 
     plan.groups[0].photos[0].source.write_bytes(b"changed")
     with pytest.raises(GooglePhotosError, match="source content may have changed"):
@@ -351,4 +380,27 @@ def test_installed_app_authorizer_reads_refresh_credentials_from_store_only(
 def test_authorizer_rejects_client_configuration_inside_repository() -> None:
     config = google_photos.repository_root() / "pyproject.toml"
     with pytest.raises(GooglePhotosError, match="outside the repository"):
+        InstalledAppAuthorizer(MemoryCredentialStore("unused", "unused")).authorized_transport(config)
+
+
+def test_authorizer_reports_missing_client_configuration(tmp_path: Path) -> None:
+    config = tmp_path / "missing-client.json"
+
+    with pytest.raises(GooglePhotosError, match="OAuth client configuration not found"):
+        InstalledAppAuthorizer(MemoryCredentialStore("unused", "unused")).authorized_transport(config)
+
+
+def test_authorizer_reports_unreadable_client_configuration(tmp_path: Path) -> None:
+    config = tmp_path / "client-directory"
+    config.mkdir()
+
+    with pytest.raises(GooglePhotosError, match="could not read OAuth client configuration"):
+        InstalledAppAuthorizer(MemoryCredentialStore("unused", "unused")).authorized_transport(config)
+
+
+def test_authorizer_reports_invalid_client_configuration(tmp_path: Path) -> None:
+    config = tmp_path / "invalid-client.json"
+    config.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(GooglePhotosError, match="invalid installed-application"):
         InstalledAppAuthorizer(MemoryCredentialStore("unused", "unused")).authorized_transport(config)

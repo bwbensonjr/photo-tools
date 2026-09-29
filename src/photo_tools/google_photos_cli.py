@@ -22,6 +22,9 @@ from photo_tools.google_photos import (
 from photo_tools.scan_metadata import ScanMetadataError, build_plan
 
 
+DEFAULT_CLIENT_CONFIG = Path("~/.config/photo-tools/google-photos-client.json")
+
+
 def _journal_slug(title: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
     return slug or "album"
@@ -30,6 +33,11 @@ def _journal_slug(title: str) -> str:
 def default_journal(root: Path, title: str) -> Path:
     """Return the operational-state location stored with the photographs."""
     return root / ".scan-tools" / f"google-photos-{_journal_slug(title)}.json"
+
+
+def default_client_config() -> Path:
+    """Return the conventional private OAuth client configuration path."""
+    return DEFAULT_CLIENT_CONFIG.expanduser()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,7 +59,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--client-config",
         type=Path,
-        help="installed-app OAuth JSON stored outside this repository",
+        help=(
+            "installed-app OAuth JSON stored outside this repository "
+            "(default: ~/.config/photo-tools/google-photos-client.json)"
+        ),
     )
     parser.add_argument(
         "--journal",
@@ -107,9 +118,6 @@ def run(
         raise GooglePhotosError(
             "--resolved-id and --resolved-url require --resolve-uncertain"
         )
-    if args.upload and args.client_config is None:
-        raise GooglePhotosError("--upload requires --client-config outside the repository")
-
     scan_plan = build_plan(args.root)
     entries = scan_plan.selected(set(args.only))
     if not entries:
@@ -121,7 +129,7 @@ def run(
         args.manifest.write_text(album_manifest_text(album_plan), encoding="utf-8")
         print(f"wrote Google Photos manifest: {args.manifest}")
     if not args.upload:
-        print("re-run with --upload and an external --client-config to contact Google Photos")
+        print("re-run with --upload to contact Google Photos")
         return 0
 
     journal_path = args.journal or default_journal(album_plan.root, album_plan.title)
@@ -135,10 +143,18 @@ def run(
         print(f"resolved uncertain operation as {args.resolve_uncertain}")
 
     oauth = authorizer or InstalledAppAuthorizer()
-    transport = oauth.authorized_transport(args.client_config)
+    client_config = args.client_config or default_client_config()
+    transport = oauth.authorized_transport(client_config)
     client = GooglePhotosClient(transport)
     try:
-        album_url = upload_album(album_plan, journal, client)
+        album_url = upload_album(
+            album_plan,
+            journal,
+            client,
+            on_folder_start=lambda folder_name: print(
+                f"uploading folder: {folder_name}"
+            ),
+        )
     except ConfirmedRequestError as error:
         raise GooglePhotosError(
             f"{error}\n{_progress_text(journal, failed='confirmed request failure')}"
@@ -148,10 +164,6 @@ def run(
 
     print(_progress_text(journal))
     print(f"album ready: {album_url}")
-    print(
-        "sharing remains manual: open the album, choose recipients or link sharing, "
-        "and review collaboration, comments, and likes"
-    )
     return 0
 
 

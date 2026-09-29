@@ -106,7 +106,7 @@ The workflow is implemented as an ordinary tested repository command, not an age
 
 1. In Google Cloud, create or select a project, enable the Google Photos Library API, and configure its OAuth consent screen. Google documents this in [Configure your app](https://developers.google.com/photos/overview/configure-your-app).
 2. Create an OAuth client ID for a Desktop app. If the consent screen is in testing, add the Google account that will own the album as a test user.
-3. Download the client JSON to a private location outside this repository, such as `/Users/bwb/.config/photo-tools/google-photos-client.json`. Never copy it into the scan root, upload journal, or source tree.
+3. Download the client JSON to the default private location, `~/.config/photo-tools/google-photos-client.json`. Never copy it into the scan root, upload journal, or source tree.
 4. Run `uv sync`. On the first explicit upload, the command opens Google's installed-application authorization flow. Refreshable authorization is stored in the operating-system credential store through `keyring`; access tokens remain in memory.
 
 The command requests only `photoslibrary.appendonly` and `photoslibrary.readonly.appcreateddata`. Google Photos does not support service accounts for this workflow. Resources remain associated with the OAuth client ID that created them, so preserve that client configuration.
@@ -125,15 +125,16 @@ The output contains the destination title, estimated Original-quality bytes, dat
 
 ### Upload explicitly
 
-After reviewing the preview, upload with the external client configuration:
+After reviewing the preview, upload using the client configuration at `~/.config/photo-tools/google-photos-client.json`:
 
 ```bash
 uv run google-photos-upload \
   --root /Users/bwb/Pictures/Scans \
   --album-title "Family scans" \
-  --client-config /Users/bwb/.config/photo-tools/google-photos-client.json \
   --upload
 ```
+
+To use a different external client file, add the optional override `--client-config /path/to/client.json`. The selected file must remain outside this repository.
 
 The default journal is `ROOT/.scan-tools/google-photos-ALBUM-TITLE.json`; use `--journal /another/path.json` to select a different location. It contains source paths and hashes, the album ID and URL, confirmed headings and media IDs, and any uncertain operation. It contains no OAuth tokens or client credentials.
 
@@ -149,7 +150,6 @@ Inspect Google Photos and the journal before resolving uncertainty. If the opera
 uv run google-photos-upload \
   --root /Users/bwb/Pictures/Scans \
   --album-title "Family scans" \
-  --client-config /Users/bwb/.config/photo-tools/google-photos-client.json \
   --upload \
   --resolve-uncertain pending
 ```

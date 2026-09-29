@@ -250,11 +250,7 @@ def render_album_preview(plan: AlbumPlan) -> str:
         for photo in group.photos:
             lines.append(f'  {photo.filename} -> description "{photo.description}"')
     lines.extend(
-        [
-            "",
-            f"preview only: {plan.photo_count} photos in {len(plan.groups)} folder groups",
-            "no OAuth flow or Google Photos request was performed",
-        ]
+        ["", f"preview only: {plan.photo_count} photos in {len(plan.groups)} folder groups"]
     )
     return "\n".join(lines)
 
@@ -510,17 +506,35 @@ class InstalledAppAuthorizer:
         from google.oauth2.credentials import Credentials
         from google_auth_oauthlib.flow import InstalledAppFlow
 
-        config_path = client_config_path.expanduser().resolve(strict=True)
+        selected_path = client_config_path.expanduser()
+        try:
+            config_path = selected_path.resolve(strict=True)
+        except FileNotFoundError as error:
+            raise GooglePhotosError(
+                f"OAuth client configuration not found: {selected_path}"
+            ) from error
+        except OSError as error:
+            raise GooglePhotosError(
+                f"could not access OAuth client configuration: {selected_path}"
+            ) from error
         repo = repository_root()
         if _inside(config_path, repo):
             raise GooglePhotosError(
                 "OAuth client configuration must be stored outside the repository"
             )
         try:
-            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config_text = config_path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise GooglePhotosError(
+                f"could not read OAuth client configuration: {config_path}"
+            ) from error
+        try:
+            config = json.loads(config_text)
             installed = config["installed"]
             client_id = installed["client_id"]
-        except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+            if not isinstance(client_id, str) or not client_id:
+                raise ValueError("client_id must be a non-empty string")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise GooglePhotosError("invalid installed-application OAuth configuration") from error
         account = hashlib.sha256(client_id.encode("utf-8")).hexdigest()
         try:
@@ -717,6 +731,8 @@ def upload_album(
     plan: AlbumPlan,
     journal: UploadJournal,
     client: GooglePhotosClient,
+    *,
+    on_folder_start: Callable[[str], None] | None = None,
 ) -> str:
     """Create or resume one ordered app-created album."""
     if journal.uncertain is not None:
@@ -746,7 +762,18 @@ def upload_album(
             raise GooglePhotosError("recorded application-created album is no longer accessible")
 
     for group in plan.groups:
-        if group.key not in journal.data["confirmed_headings"]:
+        heading_pending = group.key not in journal.data["confirmed_headings"]
+        pending = [
+            photo
+            for photo in group.photos
+            if photo.key not in journal.data["confirmed_media"]
+        ]
+        if not heading_pending and not pending:
+            continue
+        if on_folder_start is not None:
+            on_folder_start(group.folder_name)
+
+        if heading_pending:
             try:
                 enrichment_id = client.add_heading(album_id, group.heading)
             except KeyboardInterrupt as error:
@@ -757,11 +784,6 @@ def upload_album(
                 raise
             journal.confirm_heading(group.key, enrichment_id)
 
-        pending = [
-            photo
-            for photo in group.photos
-            if photo.key not in journal.data["confirmed_media"]
-        ]
         for offset in range(0, len(pending), MAX_BATCH_ITEMS):
             batch = pending[offset : offset + MAX_BATCH_ITEMS]
             tokens: list[str] = []
